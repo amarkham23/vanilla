@@ -6,23 +6,43 @@ export DISPLAY=:0
 export SDL_VIDEODRIVER=x11
 export SDL_GAMECONTROLLERCONFIG_FILE=/usr/share/vanilla/gamecontrollerdb.txt
 
+# Persistent data directory on the SD card. Fall back to RAM if the card did
+# not mount, so a missing mount can never turn into a reboot loop.
+DATA=/mnt/switchroot/vanilla/data
+if grep -qs ' /mnt ' /proc/mounts && mkdir -p "$DATA" 2>/dev/null; then
+    :
+else
+    DATA=/tmp/vanilla-data
+    mkdir -p "$DATA"
+fi
+
+# Trace this script and keep the boot-time kernel log for diagnostics
+exec 2>"$DATA/wrapper.log"
+set -x
+dmesg > "$DATA/dmesg-boot.log" 2>/dev/null
+
 # Start X
-X "$DISPLAY" -nolisten tcp vt1 &
+X "$DISPLAY" -nolisten tcp vt1 -logfile "$DATA/Xorg.0.log" &
 X_PID=$!
 
-# Wait until X is responsive
-for i in 1 2 3 4 5 6 7 8 9 10; do
-    xset q >/dev/null 2>&1 && break
-    sleep 1
+# Wait until X has created its socket (xset is not in this image)
+for i in $(seq 1 50); do
+    [ -S /tmp/.X11-unix/X0 ] && break
+    usleep 200000
 done
 
 # Run Vanilla in foreground
-/usr/bin/vanilla > /.local/share/Vanilla/vanilla.log 2>&1
+/usr/bin/vanilla > "$DATA/vanilla.log" 2>&1
 APP_RC=$?
 
 # Clean up X
 kill "$X_PID" 2>/dev/null
 wait "$X_PID" 2>/dev/null
+
+# Keep the final kernel log and make sure everything reaches the card
+dmesg > "$DATA/dmesg.log" 2>/dev/null
+sync
+umount /mnt 2>/dev/null
 
 # Reboot when app exits
 reboot -f

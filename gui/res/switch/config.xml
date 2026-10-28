@@ -14,5 +14,6 @@
 		<axes/>
 	</controls>
 	<cursorinfullscreen>0</cursorinfullscreen>
+	<safearea>2</safearea>
 	<recordingdir></recordingdir>
 </vanilla>

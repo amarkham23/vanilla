@@ -684,23 +684,28 @@ int vui_sdl_event_thread(void *data)
                     if (vanilla_axis != -1) {
                         if (vui->game_mode) {
                             vanilla_set_button(vanilla_axis, axis_value);
-                        } else if (vanilla_axis == SDL_CONTROLLER_AXIS_LEFTX) {
-                            if (axis_value < 0)
-                                vui_process_keydown(vui, VANILLA_AXIS_L_LEFT);
-                            else if (axis_value > 0)
-                                vui_process_keydown(vui, VANILLA_AXIS_L_RIGHT);
-                            else {
-                                vui_process_keyup(vui, VANILLA_AXIS_L_LEFT);
-                                vui_process_keyup(vui, VANILLA_AXIS_L_RIGHT);
+                        } else if (vanilla_axis == VANILLA_AXIS_L_X || vanilla_axis == VANILLA_AXIS_L_Y) {
+                            // Menu navigation with the left stick. vanilla_axis is a
+                            // Vanilla enum (not an SDL axis), and the stick must be
+                            // edge-triggered with hysteresis or a held stick would
+                            // fire on every motion event and race across the menu.
+                            static int stick_dir[2] = {0, 0};
+                            int idx = (vanilla_axis == VANILLA_AXIS_L_Y);
+                            int neg = idx ? VANILLA_AXIS_L_UP : VANILLA_AXIS_L_LEFT;
+                            int pos = idx ? VANILLA_AXIS_L_DOWN : VANILLA_AXIS_L_RIGHT;
+                            int dir = stick_dir[idx];
+                            if (dir == 0) {
+                                if (axis_value < -16000) dir = -1;
+                                else if (axis_value > 16000) dir = 1;
+                            } else if (axis_value > -8000 && axis_value < 8000) {
+                                dir = 0;
                             }
-                        } else if (vanilla_axis == SDL_CONTROLLER_AXIS_LEFTY) {
-                            if (axis_value < 0)
-                                vui_process_keydown(vui, VANILLA_AXIS_L_UP);
-                            else if (axis_value > 0)
-                                vui_process_keydown(vui, VANILLA_AXIS_L_DOWN);
-                            else {
-                                vui_process_keyup(vui, VANILLA_AXIS_L_UP);
-                                vui_process_keyup(vui, VANILLA_AXIS_L_DOWN);
+                            if (dir != stick_dir[idx]) {
+                                if (stick_dir[idx] < 0) vui_process_keyup(vui, neg);
+                                else if (stick_dir[idx] > 0) vui_process_keyup(vui, pos);
+                                if (dir < 0) vui_process_keydown(vui, neg);
+                                else if (dir > 0) vui_process_keydown(vui, pos);
+                                stick_dir[idx] = dir;
                             }
                         }
                     }
@@ -796,6 +801,7 @@ int vui_sdl_event_thread(void *data)
 
 int vui_init_window(vui_context_t *ctx, vui_sdl_context_t *sdl_ctx, Uint32 window_flags)
 {
+    int win_x = SDL_WINDOWPOS_CENTERED, win_y = SDL_WINDOWPOS_CENTERED;
     int win_w, win_h;
     if (window_flags & SDL_WINDOW_FULLSCREEN || window_flags & SDL_WINDOW_FULLSCREEN_DESKTOP) {
         // NOTE: Set window size to fullscreen. Theoretically, this shouldn't be
@@ -803,16 +809,34 @@ int vui_init_window(vui_context_t *ctx, vui_sdl_context_t *sdl_ctx, Uint32 windo
         //       to 854x480, everything gets cropped to that size on its 1280x720
         //       screen. Might be a bug with the specific SDL version we use in
         //       our Buildroot system, but still this is a cheap fix.
-        SDL_DisplayMode mode;
-        SDL_GetCurrentDisplayMode(0, &mode);
-        win_w = mode.w;
-        win_h = mode.h;
+        //
+        //       On a bare X server with no window manager (the Switch image),
+        //       nobody services the fullscreen request, so the window is placed
+        //       explicitly at the display's bounds instead of being centered.
+        SDL_Rect bounds;
+        if (SDL_GetDisplayBounds(0, &bounds) == 0) {
+            win_x = bounds.x;
+            win_y = bounds.y;
+            win_w = bounds.w;
+            win_h = bounds.h;
+        } else {
+            SDL_DisplayMode mode;
+            if (SDL_GetCurrentDisplayMode(0, &mode) == 0) {
+                win_w = mode.w;
+                win_h = mode.h;
+            } else {
+                vpilog("Failed to query display geometry: %s\n", SDL_GetError());
+                win_w = ctx->screen_width;
+                win_h = ctx->screen_height;
+            }
+        }
+        window_flags |= SDL_WINDOW_BORDERLESS;
     } else {
         win_w = ctx->screen_width;
         win_h = ctx->screen_height;
     }
 
-    sdl_ctx->window = SDL_CreateWindow("Vanilla", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, win_w, win_h, window_flags);
+    sdl_ctx->window = SDL_CreateWindow("Vanilla", win_x, win_y, win_w, win_h, window_flags);
     if (!sdl_ctx->window) {
         vpilog("Failed to CreateWindow: %s\n", SDL_GetError());
         return -1;
@@ -822,6 +846,25 @@ int vui_init_window(vui_context_t *ctx, vui_sdl_context_t *sdl_ctx, Uint32 windo
     if (!sdl_ctx->renderer) {
         vpilog("Failed to CreateRenderer: %s\n", SDL_GetError());
         return -1;
+    }
+
+    // Log what SDL believes the screen and window geometry are. If the picture
+    // is cropped or offset on a panel, these numbers point at the mismatch.
+    {
+        SDL_PumpEvents();
+        int ww = 0, wh = 0, wx = 0, wy = 0, rw = 0, rh = 0;
+        SDL_Rect b = {0, 0, 0, 0}, ub = {0, 0, 0, 0};
+        SDL_DisplayMode m = {0};
+        SDL_GetWindowSize(sdl_ctx->window, &ww, &wh);
+        SDL_GetWindowPosition(sdl_ctx->window, &wx, &wy);
+        SDL_GetRendererOutputSize(sdl_ctx->renderer, &rw, &rh);
+        SDL_GetDisplayBounds(0, &b);
+        SDL_GetDisplayUsableBounds(0, &ub);
+        SDL_GetCurrentDisplayMode(0, &m);
+        vpilog("Display geometry: displays=%i mode=%ix%i@%i bounds=%i,%i %ix%i usable=%i,%i %ix%i window=%i,%i %ix%i output=%ix%i driver=%s\n",
+               SDL_GetNumVideoDisplays(), m.w, m.h, m.refresh_rate,
+               b.x, b.y, b.w, b.h, ub.x, ub.y, ub.w, ub.h,
+               wx, wy, ww, wh, rw, rh, SDL_GetCurrentVideoDriver());
     }
 
     return 0;
@@ -2534,7 +2577,10 @@ int vui_update_sdl(vui_context_t *vui)
         int out_w, out_h;
         int tex_w = vui->screen_width, tex_h = vui->screen_height;
 
-        SDL_GetRendererOutputSize(renderer, &out_w, &out_h);
+        if (SDL_GetRendererOutputSize(renderer, &out_w, &out_h) != 0 || out_w <= 0 || out_h <= 0) {
+            out_w = tex_w;
+            out_h = tex_h;
+        }
 
         // Hold a reference to the dst_rect for later mouse operations
         SDL_Rect *dst_rect = &sdl_ctx->dst_rect;
@@ -2553,6 +2599,19 @@ int vui_update_sdl(vui_context_t *vui)
             dst_rect->x = 0;
             dst_rect->h = (uint64_t)out_w * tex_h / tex_w;
             dst_rect->y = (out_h - dst_rect->h) / 2;
+        }
+
+        // Optional safe area: shrink the picture symmetrically by a percentage
+        // of its size so that nothing lands under a bezel or beyond a panel
+        // whose real visible area is smaller than what the display reports.
+        // Touch input uses the same rectangle, so it stays aligned.
+        if (vpi_config.safe_area_pct > 0 && vpi_config.safe_area_pct < 50) {
+            int dx = dst_rect->w * vpi_config.safe_area_pct / 200;
+            int dy = dst_rect->h * vpi_config.safe_area_pct / 200;
+            dst_rect->x += dx;
+            dst_rect->y += dy;
+            dst_rect->w -= 2 * dx;
+            dst_rect->h -= 2 * dy;
         }
 
         // Copy texture to window

@@ -3,6 +3,11 @@
 /bin/mount -t devtmpfs devtmpfs /dev
 /bin/mount -t sysfs sysfs /sys
 
+# The kernel is built with the user-mode firmware helper fallback, but this
+# image ships no helper, so a request for a firmware file that is missing from
+# the initramfs would otherwise block its driver for the default 60 seconds.
+[ -w /sys/class/firmware/timeout ] && echo 1 > /sys/class/firmware/timeout
+
 # Take control of framebuffer
 echo 1 > /sys/class/graphics/fb0/blank
 echo 0 > /sys/class/graphics/fb0/state

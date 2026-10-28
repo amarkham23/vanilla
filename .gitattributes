@@ -1,0 +1,9 @@
+# The buildroot overlay is copied verbatim into the image; shell scripts must
+# stay LF and symlinks must stay symlinks regardless of the host checkout.
+* text=auto eol=lf
+*.bmp binary
+*.png binary
+*.jpg binary
+*.ttf binary
+*.bin binary
+*.jks binary
