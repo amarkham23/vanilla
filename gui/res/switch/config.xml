@@ -15,5 +15,6 @@
 	</controls>
 	<cursorinfullscreen>0</cursorinfullscreen>
 	<safearea>2</safearea>
+	<brightness>1.0</brightness>
 	<recordingdir></recordingdir>
 </vanilla>
