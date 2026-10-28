@@ -22,6 +22,7 @@ struct wpa_ctrl;
 extern char wireless_interface[];
 
 #define VANILLA_MAX_EVENT_COUNT 100
+#define EVENT_BUFFER_SIZE 65536 // size of every event's data buffer (largest is a whole video frame)
 typedef struct
 {
     vanilla_event_t events[VANILLA_MAX_EVENT_COUNT];

@@ -41,6 +41,7 @@ static int idr_is_queued = 0;
 
 #define VIDEO_PACKET_QUEUE_MAX 1024
 static VideoPacket video_packet_queue[VIDEO_PACKET_QUEUE_MAX];
+static uint16_t video_packet_len[VIDEO_PACKET_QUEUE_MAX]; // bytes actually received into each slot
 static size_t video_packet_min = 0;
 static size_t video_packet_max = 0;
 static pthread_mutex_t video_packet_mutex;
@@ -138,8 +139,59 @@ static uint8_t *write_slice_nal(int is_idr, int frame_decode_num, uint8_t *out)
     return out;
 }
 
-void handle_video_packet(gamepad_context_t *ctx, VideoPacket *vp)
+// Frame reassembly state. Reset by listen_video() at the start of a session.
+static VideoPacket *video_segments[VIDEO_PACKET_QUEUE_MAX];
+static int video_packet_seq = -1;
+static int video_packet_seq_end = -1;
+static int video_complete_frame = 0;
+static int video_expected_seq = -1;
+static uint8_t frame_decode_num = 0;
+static struct timeval last_idr_request = {0, 0};
+
+// The video header: 4 bytes of bit fields, 4 bytes timestamp, 8 bytes extended
+#define VIDEO_PACKET_HEADER_SIZE 16
+
+// Minimum spacing between IDR requests. One request per lost packet (or per
+// frame while waiting) just adds traffic to a link that is already dropping
+// packets; if a request is lost the next one goes out after this interval.
+#define IDR_REQUEST_INTERVAL_MS 100
+
+static void request_idr_from_console(gamepad_context_t *ctx)
 {
+    struct timeval now;
+    gettimeofday(&now, NULL);
+    if (last_idr_request.tv_sec != 0) {
+        long elapsed_ms = (now.tv_sec - last_idr_request.tv_sec) * 1000L
+                        + (now.tv_usec - last_idr_request.tv_usec) / 1000L;
+        if (elapsed_ms >= 0 && elapsed_ms < IDR_REQUEST_INTERVAL_MS) {
+            return;
+        }
+    }
+    last_idr_request = now;
+    send_idr_request_to_console(ctx->socket_msg);
+}
+
+// Called when packets went missing: whatever frame is in flight cannot be
+// completed, and the decoder's reference chain is broken until the console
+// sends a new IDR frame.
+static void video_lost_packets(gamepad_context_t *ctx, const char *why, int detail)
+{
+    vanilla_log("video: %s (%i), requesting IDR", why, detail);
+    video_packet_seq = -1;
+    video_packet_seq_end = -1;
+    video_complete_frame = 0;
+    request_idr_from_console(ctx);
+}
+
+void handle_video_packet(gamepad_context_t *ctx, VideoPacket *vp, size_t recv_len)
+{
+    // A datagram shorter than the header cannot be interpreted at all. Treat
+    // it as a lost packet rather than parsing whatever the queue slot held.
+    if (recv_len < VIDEO_PACKET_HEADER_SIZE) {
+        video_lost_packets(ctx, "short datagram", (int) recv_len);
+        return;
+    }
+
     //
     // === IMPORTANT NOTE! ===
     //
@@ -157,6 +209,23 @@ void handle_video_packet(gamepad_context_t *ctx, VideoPacket *vp)
     vp->seq_id = reverse_bits(vp->seq_id, 10);
     vp->payload_size = reverse_bits(vp->payload_size, 11);
 
+    // The payload must actually have arrived. A truncated datagram would
+    // otherwise be assembled from stale bytes left in the queue slot.
+    if (vp->payload_size > recv_len - VIDEO_PACKET_HEADER_SIZE) {
+        video_lost_packets(ctx, "truncated datagram", (int) recv_len);
+        return;
+    }
+
+    // Sequence numbers are continuous across frames, so a gap means packets
+    // were lost. Without this check the loss of an entire frame (including
+    // its frame_begin/frame_end markers) would go unnoticed, and every
+    // following P-frame would decode against a missing reference until some
+    // later partial loss happened to trigger an IDR request.
+    if (video_expected_seq != -1 && vp->seq_id != video_expected_seq) {
+        video_lost_packets(ctx, "sequence gap, expected", video_expected_seq);
+    }
+    video_expected_seq = (vp->seq_id + 1) % VIDEO_PACKET_QUEUE_MAX;
+
     // Check if packet is IDR (instantaneous decoder refresh)
     int is_idr = 0;
     for (int i = 0; i < sizeof(vp->extended_header); i++) {
@@ -165,14 +234,6 @@ void handle_video_packet(gamepad_context_t *ctx, VideoPacket *vp)
             break;
         }
     }
-
-    // Check if this is the beginning of the packet
-    static VideoPacket *video_segments[VIDEO_PACKET_QUEUE_MAX];
-    static int video_packet_seq = -1;
-    static int video_packet_seq_end = -1;
-    static int video_complete_frame = 0;
-
-	static uint8_t frame_decode_num = 0;
 
     if (vp->frame_begin) {
         video_packet_seq = vp->seq_id;
@@ -187,16 +248,23 @@ void handle_video_packet(gamepad_context_t *ctx, VideoPacket *vp)
         }
 
         if (!video_complete_frame && !is_idr) {
-            send_idr_request_to_console(ctx->socket_msg);
+            // The previous frame was not delivered, so this P-frame has no
+            // valid reference. Keep asking for an IDR until one arrives.
+            video_packet_seq = -1;
+            request_idr_from_console(ctx);
             return;
         }
 
         video_complete_frame = 0;
+    } else if (video_packet_seq == -1) {
+        // Continuation of a frame we are not assembling (its beginning was
+        // lost, or it arrived before the first frame_begin). Nothing to do.
+        return;
     }
 
     pthread_mutex_lock(&idr_mutex);
     if (idr_is_queued) {
-        send_idr_request_to_console(ctx->socket_msg);
+        request_idr_from_console(ctx);
         idr_is_queued = 0;
     }
     pthread_mutex_unlock(&idr_mutex);
@@ -209,14 +277,16 @@ void handle_video_packet(gamepad_context_t *ctx, VideoPacket *vp)
 
     if (video_packet_seq != -1 && video_packet_seq_end != -1) {
         int complete_frame = 1;
+        size_t payload_total = 0;
         {
             int current_index = video_packet_seq;
             while (1) {
                 if (!video_segments[current_index]) {
                     complete_frame = 0;
-                    vanilla_log("damn, incomplete frame (missing %i)", current_index);
+                    video_lost_packets(ctx, "incomplete frame, missing", current_index);
                     break;
                 }
+                payload_total += video_segments[current_index]->payload_size;
 
                 if (current_index == video_packet_seq_end) {
                     break;
@@ -224,6 +294,15 @@ void handle_video_packet(gamepad_context_t *ctx, VideoPacket *vp)
 
                 current_index = (current_index + 1) % VIDEO_PACKET_QUEUE_MAX;
             }
+        }
+
+        // The assembled frame (payload plus emulation-prevention bytes, which
+        // can add up to a third, plus parameter sets and start codes) has to
+        // fit the fixed event buffer. A frame that cannot fit is dropped
+        // instead of overrunning the buffer.
+        if (complete_frame && payload_total + payload_total / 2 + 1024 > EVENT_BUFFER_SIZE) {
+            complete_frame = 0;
+            video_lost_packets(ctx, "frame too large for event buffer", (int) payload_total);
         }
 
         if (complete_frame) {
@@ -342,6 +421,12 @@ void handle_video_packet(gamepad_context_t *ctx, VideoPacket *vp)
 			// vanilla_log_no_newline("\n");
 
 			release_event(ctx->event_loop);
+
+            // The frame has been published. Disarm the range so that later
+            // packets (e.g. a frame whose frame_begin was lost) cannot cause
+            // the same frame to be assembled and published again.
+            video_packet_seq = -1;
+            video_packet_seq_end = -1;
         } else {
             // We didn't receive the complete frame so we'll skip it here
         }
@@ -356,10 +441,12 @@ void *consume_video_packets(void *data)
 
     while (!is_interrupted()) {
         while (video_packet_min < video_packet_max) {
-            VideoPacket *vp = &video_packet_queue[video_packet_min % VIDEO_PACKET_QUEUE_MAX];
+            size_t slot = video_packet_min % VIDEO_PACKET_QUEUE_MAX;
+            VideoPacket *vp = &video_packet_queue[slot];
+            size_t len = video_packet_len[slot];
 
             pthread_mutex_unlock(&video_packet_mutex);
-            handle_video_packet(ctx, vp);
+            handle_video_packet(ctx, vp, len);
             pthread_mutex_lock(&video_packet_mutex);
 
             video_packet_min++;
@@ -397,14 +484,28 @@ void *listen_video(void *x)
     pthread_mutex_init(&video_packet_mutex, NULL);
     pthread_cond_init(&video_packet_cond, NULL);
 
+    // Fresh session: nothing from a previous connection may influence this one
+    video_packet_min = 0;
+    video_packet_max = 0;
+    memset(video_segments, 0, sizeof(video_segments));
+    video_packet_seq = -1;
+    video_packet_seq_end = -1;
+    video_complete_frame = 0;
+    video_expected_seq = -1;
+    frame_decode_num = 0;
+    last_idr_request.tv_sec = 0;
+    last_idr_request.tv_usec = 0;
+
     pthread_t video_consumer_thread;
     pthread_create(&video_consumer_thread, 0, consume_video_packets, info);
 
     do {
-        VideoPacket *vp = &video_packet_queue[video_packet_max % VIDEO_PACKET_QUEUE_MAX];
+        size_t slot = video_packet_max % VIDEO_PACKET_QUEUE_MAX;
+        VideoPacket *vp = &video_packet_queue[slot];
         size = recv(info->socket_vid, (void *) vp, sizeof(VideoPacket), 0);
         if (size > 0) {
             pthread_mutex_lock(&video_packet_mutex);
+            video_packet_len[slot] = (uint16_t) size;
             video_packet_max++;
             if (video_packet_max == video_packet_min + VIDEO_PACKET_QUEUE_MAX) {
                 vanilla_log("WARNING: ROLLED OVER VIDEO PACKET QUEUE");

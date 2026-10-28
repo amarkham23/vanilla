@@ -2387,7 +2387,7 @@ static const char *g_sharpen_fs =
     "    mx += max(max(max(a, c), max(g, i)), mx);\n"
     "    vec3 rcpM = 1.0 / max(mx, vec3(0.001));\n"
     "    vec3 amp = sqrt(clamp(min(mn, 2.0 - mx) * rcpM, 0.0, 1.0));\n"
-    "    float peak = -1.0 / mix(8.0, 5.0, clamp(u_sharp, 0.0, 1.0));\n"
+    "    float peak = -1.0 / mix(8.0, 4.0, clamp(u_sharp, 0.0, 1.0));\n"
     "    vec3 w = amp * peak;\n"
     "    vec3 o = ((b + d + f + h) * w + e) / (1.0 + 4.0 * w);\n"
     "    gl_FragColor = vec4(clamp(o, 0.0, 1.0), 1.0);\n"
@@ -2504,7 +2504,7 @@ static int vui_sdl_sharpen_init(vui_sdl_sharpen_t *s)
 
 // Returns 1 if the texture was drawn by the sharpening pass, 0 if the caller
 // should fall back to SDL_RenderCopy.
-static int vui_sdl_sharpen_blit(SDL_Renderer *renderer, SDL_Texture *tex, const SDL_Rect *dst, int out_h)
+static int vui_sdl_sharpen_blit(SDL_Renderer *renderer, SDL_Texture *tex, int tex_w, int tex_h, const SDL_Rect *dst, int out_h)
 {
     vui_sdl_sharpen_t *s = &g_sharpen;
 
@@ -2556,9 +2556,11 @@ static int vui_sdl_sharpen_blit(SDL_Renderer *renderer, SDL_Texture *tex, const 
     s->Disable(GL_SCISSOR_TEST);
     s->Viewport(dst->x, out_h - dst->y - dst->h, dst->w, dst->h);
     s->Uniform1i(s->u_tex, 0);
-    // One output pixel expressed in texture coordinates: the kernel runs at
-    // output resolution over the bilinearly upscaled picture.
-    s->Uniform2f(s->u_texel, texw / (float) dst->w, texh / (float) dst->h);
+    // One source texel in texture coordinates: the kernel's taps land on the
+    // real neighbouring pixels of the 854x480 canvas rather than on the
+    // bilinear in-betweens of the upscaled picture, which is what gives the
+    // sharpening its bite at a 1.5x upscale.
+    s->Uniform2f(s->u_texel, texw / (float) tex_w, texh / (float) tex_h);
     s->Uniform1f(s->u_sharp, vpi_config.sharpen);
     s->VertexAttribPointer(s->a_pos, 2, GL_FLOAT, GL_FALSE, 0, pos);
     s->VertexAttribPointer(s->a_uv, 2, GL_FLOAT, GL_FALSE, 0, uv);
@@ -2931,7 +2933,7 @@ int vui_update_sdl(vui_context_t *vui)
         SDL_RenderClear(renderer);
         int drawn = 0;
 #ifdef VANILLA_HAS_EGL
-        drawn = vui_sdl_sharpen_blit(renderer, main_tex, dst_rect, out_h);
+        drawn = vui_sdl_sharpen_blit(renderer, main_tex, tex_w, tex_h, dst_rect, out_h);
 #endif
         if (!drawn) {
             SDL_RenderCopy(renderer, main_tex, NULL, dst_rect);

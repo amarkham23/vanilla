@@ -7,6 +7,7 @@
 #endif
 
 #include <pthread.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -147,7 +148,18 @@ void handle_audio_packet(gamepad_context_t *ctx, unsigned char *data, size_t len
     ap->payload_size = ntohs(ap->payload_size);
     // ap->timestamp = reverse_bits(ap->timestamp, 32);
 
+    // The payload length comes from the wire; it must not exceed what was
+    // actually received or the event copy would read past the buffer.
+    const size_t header_size = offsetof(AudioPacket, payload);
+    if (len < header_size || ap->payload_size > len - header_size) {
+        vanilla_log("audio: dropping datagram of %zu bytes with payload_size %u", len, (unsigned) ap->payload_size);
+        return;
+    }
+
     if (ap->type == TYPE_VIDEO) {
+        if (ap->payload_size < sizeof(AudioPacketVideoFormat)) {
+            return;
+        }
         AudioPacketVideoFormat *avp = (AudioPacketVideoFormat *) ap->payload;
         avp->timestamp = ntohl(avp->timestamp);
         avp->video_format = ntohl(avp->video_format);

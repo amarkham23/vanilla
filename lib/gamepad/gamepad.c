@@ -23,7 +23,7 @@ static const int MAX_PIPE_RETRY = 5;
 
 char wireless_interface[128];
 
-#define EVENT_BUFFER_SIZE 65536
+// EVENT_BUFFER_SIZE is defined in gamepad.h
 #define EVENT_BUFFER_ARENA_SIZE VANILLA_MAX_EVENT_COUNT * 2
 uint8_t *EVENT_BUFFER_ARENA[EVENT_BUFFER_ARENA_SIZE] = {0};
 pthread_mutex_t event_buffer_mutex = PTHREAD_MUTEX_INITIALIZER;
