@@ -168,6 +168,12 @@ void vpi_config_save()
     sprintf(buf, "%i", vpi_config.safe_area_pct);
     xmlTextWriterWriteElement(writer, BAD_CAST "safearea", BAD_CAST buf);
 
+    sprintf(buf, "%f", vpi_config.sharpen);
+    xmlTextWriterWriteElement(writer, BAD_CAST "sharpen", BAD_CAST buf);
+
+    sprintf(buf, "%i", vpi_config.sharpen_flip);
+    xmlTextWriterWriteElement(writer, BAD_CAST "sharpenflip", BAD_CAST buf);
+
     xmlTextWriterWriteElement(writer, BAD_CAST "recordingdir", BAD_CAST vpi_config.recording_dir);
 
     xmlTextWriterEndElement(writer); // vanilla
@@ -192,6 +198,8 @@ void vpi_config_init()
     vpi_config.autoconnect = -1;
     vpi_config.screen_brightness = 0.5f;
     vpi_config.safe_area_pct = 0;
+    vpi_config.sharpen = 0.0f;
+    vpi_config.sharpen_flip = 0;
 
     // Load from file
     char config_fn[1024];
@@ -339,6 +347,14 @@ void vpi_config_init()
                     } else if (!strcmp((const char *) child->name, "safearea")) {
                         if (child->children && child->children->content) {
                             vpi_config.safe_area_pct = atoi((const char *) child->children->content);
+                        }
+                    } else if (!strcmp((const char *) child->name, "sharpen")) {
+                        if (child->children && child->children->content) {
+                            vpi_config.sharpen = atof((const char *) child->children->content);
+                        }
+                    } else if (!strcmp((const char *) child->name, "sharpenflip")) {
+                        if (child->children && child->children->content) {
+                            vpi_config.sharpen_flip = atoi((const char *) child->children->content);
                         }
                     }
                 }

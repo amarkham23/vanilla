@@ -2272,6 +2272,318 @@ static void vui_sdl_wait_for_next_tick(vui_sdl_context_t *sdl_ctx)
 }
 
 // Rendering/main thread
+#ifdef VANILLA_HAS_EGL
+/*
+ * Sharpening upscale pass for the final blit.
+ *
+ * SDL's renderer stretches the 854x480 canvas to the window with plain
+ * bilinear filtering, which is where most of the softness on a 1280x720
+ * panel comes from. When vpi_config.sharpen is set, the final copy is done
+ * with a small GLES2 program instead: the canvas is sampled bilinearly at
+ * output resolution and a contrast-adaptive sharpening kernel (after AMD's
+ * FidelityFX CAS, MIT) is applied, which sharpens edges without ringing on
+ * already-crisp pixels.
+ *
+ * The pass runs between SDL_RenderFlush and SDL_RenderPresent and restores
+ * every piece of GL state that SDL's GLES2 backend caches (program, blend,
+ * scissor, viewport, vertex attrib arrays, array buffer) so SDL's view of
+ * the context stays accurate.
+ */
+typedef GLuint (*vui_gl_createshader_t)(GLenum);
+typedef void (*vui_gl_shadersource_t)(GLuint, GLsizei, const GLchar *const *, const GLint *);
+typedef void (*vui_gl_compileshader_t)(GLuint);
+typedef void (*vui_gl_getshaderiv_t)(GLuint, GLenum, GLint *);
+typedef void (*vui_gl_getshaderinfolog_t)(GLuint, GLsizei, GLsizei *, GLchar *);
+typedef void (*vui_gl_deleteshader_t)(GLuint);
+typedef GLuint (*vui_gl_createprogram_t)(void);
+typedef void (*vui_gl_attachshader_t)(GLuint, GLuint);
+typedef void (*vui_gl_linkprogram_t)(GLuint);
+typedef void (*vui_gl_getprogramiv_t)(GLuint, GLenum, GLint *);
+typedef void (*vui_gl_getprograminfolog_t)(GLuint, GLsizei, GLsizei *, GLchar *);
+typedef void (*vui_gl_deleteprogram_t)(GLuint);
+typedef void (*vui_gl_useprogram_t)(GLuint);
+typedef GLint (*vui_gl_getattriblocation_t)(GLuint, const GLchar *);
+typedef GLint (*vui_gl_getuniformlocation_t)(GLuint, const GLchar *);
+typedef void (*vui_gl_uniform1i_t)(GLint, GLint);
+typedef void (*vui_gl_uniform1f_t)(GLint, GLfloat);
+typedef void (*vui_gl_uniform2f_t)(GLint, GLfloat, GLfloat);
+typedef void (*vui_gl_vertexattribpointer_t)(GLuint, GLint, GLenum, GLboolean, GLsizei, const void *);
+typedef void (*vui_gl_enablevertexattribarray_t)(GLuint);
+typedef void (*vui_gl_getvertexattribiv_t)(GLuint, GLenum, GLint *);
+typedef void (*vui_gl_drawarrays_t)(GLenum, GLint, GLsizei);
+typedef void (*vui_gl_viewport_t)(GLint, GLint, GLsizei, GLsizei);
+typedef void (*vui_gl_getintegerv_t)(GLenum, GLint *);
+typedef void (*vui_gl_bindbuffer_t)(GLenum, GLuint);
+typedef GLboolean (*vui_gl_isenabled_t)(GLenum);
+typedef void (*vui_gl_enable_t)(GLenum);
+typedef void (*vui_gl_activetexture_t)(GLenum);
+
+typedef struct {
+    int state; // 0 = not initialised, 1 = ready, -1 = unavailable
+    GLuint program;
+    GLint a_pos, a_uv, u_tex, u_texel, u_sharp;
+    vui_gl_createshader_t CreateShader;
+    vui_gl_shadersource_t ShaderSource;
+    vui_gl_compileshader_t CompileShader;
+    vui_gl_getshaderiv_t GetShaderiv;
+    vui_gl_getshaderinfolog_t GetShaderInfoLog;
+    vui_gl_deleteshader_t DeleteShader;
+    vui_gl_createprogram_t CreateProgram;
+    vui_gl_attachshader_t AttachShader;
+    vui_gl_linkprogram_t LinkProgram;
+    vui_gl_getprogramiv_t GetProgramiv;
+    vui_gl_getprograminfolog_t GetProgramInfoLog;
+    vui_gl_deleteprogram_t DeleteProgram;
+    vui_gl_useprogram_t UseProgram;
+    vui_gl_getattriblocation_t GetAttribLocation;
+    vui_gl_getuniformlocation_t GetUniformLocation;
+    vui_gl_uniform1i_t Uniform1i;
+    vui_gl_uniform1f_t Uniform1f;
+    vui_gl_uniform2f_t Uniform2f;
+    vui_gl_vertexattribpointer_t VertexAttribPointer;
+    vui_gl_enablevertexattribarray_t EnableVertexAttribArray;
+    vui_gl_enablevertexattribarray_t DisableVertexAttribArray;
+    vui_gl_getvertexattribiv_t GetVertexAttribiv;
+    vui_gl_drawarrays_t DrawArrays;
+    vui_gl_viewport_t Viewport;
+    vui_gl_getintegerv_t GetIntegerv;
+    vui_gl_bindbuffer_t BindBuffer;
+    vui_gl_isenabled_t IsEnabled;
+    vui_gl_enable_t Enable;
+    vui_gl_enable_t Disable;
+    vui_gl_activetexture_t ActiveTexture;
+} vui_sdl_sharpen_t;
+
+static vui_sdl_sharpen_t g_sharpen;
+
+static const char *g_sharpen_vs =
+    "attribute vec2 a_pos;\n"
+    "attribute vec2 a_uv;\n"
+    "varying vec2 v_uv;\n"
+    "void main() {\n"
+    "    v_uv = a_uv;\n"
+    "    gl_Position = vec4(a_pos, 0.0, 1.0);\n"
+    "}\n";
+
+static const char *g_sharpen_fs =
+    "precision mediump float;\n"
+    "uniform sampler2D u_tex;\n"
+    "uniform vec2 u_texel;\n"
+    "uniform float u_sharp;\n"
+    "varying vec2 v_uv;\n"
+    "void main() {\n"
+    "    vec3 a = texture2D(u_tex, v_uv + vec2(-u_texel.x, -u_texel.y)).rgb;\n"
+    "    vec3 b = texture2D(u_tex, v_uv + vec2( 0.0,       -u_texel.y)).rgb;\n"
+    "    vec3 c = texture2D(u_tex, v_uv + vec2( u_texel.x, -u_texel.y)).rgb;\n"
+    "    vec3 d = texture2D(u_tex, v_uv + vec2(-u_texel.x,  0.0)).rgb;\n"
+    "    vec3 e = texture2D(u_tex, v_uv).rgb;\n"
+    "    vec3 f = texture2D(u_tex, v_uv + vec2( u_texel.x,  0.0)).rgb;\n"
+    "    vec3 g = texture2D(u_tex, v_uv + vec2(-u_texel.x,  u_texel.y)).rgb;\n"
+    "    vec3 h = texture2D(u_tex, v_uv + vec2( 0.0,        u_texel.y)).rgb;\n"
+    "    vec3 i = texture2D(u_tex, v_uv + vec2( u_texel.x,  u_texel.y)).rgb;\n"
+    "    vec3 mn = min(min(min(d, e), min(f, b)), h);\n"
+    "    vec3 mx = max(max(max(d, e), max(f, b)), h);\n"
+    "    mn += min(min(min(a, c), min(g, i)), mn);\n"
+    "    mx += max(max(max(a, c), max(g, i)), mx);\n"
+    "    vec3 rcpM = 1.0 / max(mx, vec3(0.001));\n"
+    "    vec3 amp = sqrt(clamp(min(mn, 2.0 - mx) * rcpM, 0.0, 1.0));\n"
+    "    float peak = -1.0 / mix(8.0, 5.0, clamp(u_sharp, 0.0, 1.0));\n"
+    "    vec3 w = amp * peak;\n"
+    "    vec3 o = ((b + d + f + h) * w + e) / (1.0 + 4.0 * w);\n"
+    "    gl_FragColor = vec4(clamp(o, 0.0, 1.0), 1.0);\n"
+    "}\n";
+
+static GLuint vui_sdl_sharpen_compile(vui_sdl_sharpen_t *s, GLenum type, const char *src)
+{
+    GLuint shader = s->CreateShader(type);
+    if (!shader) {
+        return 0;
+    }
+    s->ShaderSource(shader, 1, (const GLchar *const *) &src, NULL);
+    s->CompileShader(shader);
+    GLint ok = 0;
+    s->GetShaderiv(shader, GL_COMPILE_STATUS, &ok);
+    if (!ok) {
+        char log[512];
+        GLsizei len = 0;
+        s->GetShaderInfoLog(shader, sizeof(log) - 1, &len, log);
+        log[len < 0 ? 0 : len] = 0;
+        vpilog("Sharpen: shader compile failed: %s\n", log);
+        s->DeleteShader(shader);
+        return 0;
+    }
+    return shader;
+}
+
+static int vui_sdl_sharpen_init(vui_sdl_sharpen_t *s)
+{
+    if (s->state != 0) {
+        return s->state == 1;
+    }
+    s->state = -1;
+
+#define VUI_GL_LOAD(member, name) \
+    s->member = (void *) SDL_GL_GetProcAddress(name); \
+    if (!s->member) { vpilog("Sharpen: %s unavailable, pass disabled\n", name); return 0; }
+    VUI_GL_LOAD(CreateShader, "glCreateShader");
+    VUI_GL_LOAD(ShaderSource, "glShaderSource");
+    VUI_GL_LOAD(CompileShader, "glCompileShader");
+    VUI_GL_LOAD(GetShaderiv, "glGetShaderiv");
+    VUI_GL_LOAD(GetShaderInfoLog, "glGetShaderInfoLog");
+    VUI_GL_LOAD(DeleteShader, "glDeleteShader");
+    VUI_GL_LOAD(CreateProgram, "glCreateProgram");
+    VUI_GL_LOAD(AttachShader, "glAttachShader");
+    VUI_GL_LOAD(LinkProgram, "glLinkProgram");
+    VUI_GL_LOAD(GetProgramiv, "glGetProgramiv");
+    VUI_GL_LOAD(GetProgramInfoLog, "glGetProgramInfoLog");
+    VUI_GL_LOAD(DeleteProgram, "glDeleteProgram");
+    VUI_GL_LOAD(UseProgram, "glUseProgram");
+    VUI_GL_LOAD(GetAttribLocation, "glGetAttribLocation");
+    VUI_GL_LOAD(GetUniformLocation, "glGetUniformLocation");
+    VUI_GL_LOAD(Uniform1i, "glUniform1i");
+    VUI_GL_LOAD(Uniform1f, "glUniform1f");
+    VUI_GL_LOAD(Uniform2f, "glUniform2f");
+    VUI_GL_LOAD(VertexAttribPointer, "glVertexAttribPointer");
+    VUI_GL_LOAD(EnableVertexAttribArray, "glEnableVertexAttribArray");
+    VUI_GL_LOAD(DisableVertexAttribArray, "glDisableVertexAttribArray");
+    VUI_GL_LOAD(GetVertexAttribiv, "glGetVertexAttribiv");
+    VUI_GL_LOAD(DrawArrays, "glDrawArrays");
+    VUI_GL_LOAD(Viewport, "glViewport");
+    VUI_GL_LOAD(GetIntegerv, "glGetIntegerv");
+    VUI_GL_LOAD(BindBuffer, "glBindBuffer");
+    VUI_GL_LOAD(IsEnabled, "glIsEnabled");
+    VUI_GL_LOAD(Enable, "glEnable");
+    VUI_GL_LOAD(Disable, "glDisable");
+    VUI_GL_LOAD(ActiveTexture, "glActiveTexture");
+#undef VUI_GL_LOAD
+
+    GLuint vs = vui_sdl_sharpen_compile(s, GL_VERTEX_SHADER, g_sharpen_vs);
+    GLuint fs = vs ? vui_sdl_sharpen_compile(s, GL_FRAGMENT_SHADER, g_sharpen_fs) : 0;
+    if (!vs || !fs) {
+        if (vs) s->DeleteShader(vs);
+        return 0;
+    }
+
+    s->program = s->CreateProgram();
+    s->AttachShader(s->program, vs);
+    s->AttachShader(s->program, fs);
+    s->LinkProgram(s->program);
+    s->DeleteShader(vs);
+    s->DeleteShader(fs);
+
+    GLint ok = 0;
+    s->GetProgramiv(s->program, GL_LINK_STATUS, &ok);
+    if (!ok) {
+        char log[512];
+        GLsizei len = 0;
+        s->GetProgramInfoLog(s->program, sizeof(log) - 1, &len, log);
+        log[len < 0 ? 0 : len] = 0;
+        vpilog("Sharpen: program link failed: %s\n", log);
+        s->DeleteProgram(s->program);
+        s->program = 0;
+        return 0;
+    }
+
+    s->a_pos = s->GetAttribLocation(s->program, "a_pos");
+    s->a_uv = s->GetAttribLocation(s->program, "a_uv");
+    s->u_tex = s->GetUniformLocation(s->program, "u_tex");
+    s->u_texel = s->GetUniformLocation(s->program, "u_texel");
+    s->u_sharp = s->GetUniformLocation(s->program, "u_sharp");
+    if (s->a_pos < 0 || s->a_uv < 0 || s->u_tex < 0 || s->u_texel < 0 || s->u_sharp < 0) {
+        vpilog("Sharpen: program is missing an attribute or uniform, pass disabled\n");
+        s->DeleteProgram(s->program);
+        s->program = 0;
+        return 0;
+    }
+
+    vpilog("Sharpen: GLES2 sharpening pass ready (strength %.2f, flip %i)\n",
+           vpi_config.sharpen, vpi_config.sharpen_flip);
+    s->state = 1;
+    return 1;
+}
+
+// Returns 1 if the texture was drawn by the sharpening pass, 0 if the caller
+// should fall back to SDL_RenderCopy.
+static int vui_sdl_sharpen_blit(SDL_Renderer *renderer, SDL_Texture *tex, const SDL_Rect *dst, int out_h)
+{
+    vui_sdl_sharpen_t *s = &g_sharpen;
+
+    if (vpi_config.sharpen <= 0.0f) {
+        return 0;
+    }
+
+    // Only the GLES2 renderer is supported by this pass
+    SDL_RendererInfo info;
+    if (SDL_GetRendererInfo(renderer, &info) != 0 || strcmp(info.name, "opengles2") != 0) {
+        return 0;
+    }
+
+    if (!vui_sdl_sharpen_init(s)) {
+        return 0;
+    }
+
+    // Make sure everything SDL has queued (the clear) is in the command stream first
+    SDL_RenderFlush(renderer);
+
+    // Save the state SDL's GLES2 backend caches
+    GLint saved_program = 0, saved_buffer = 0, saved_viewport[4] = {0, 0, 0, 0};
+    GLint saved_attrib[3] = {0, 0, 0};
+    s->GetIntegerv(GL_CURRENT_PROGRAM, &saved_program);
+    s->GetIntegerv(GL_ARRAY_BUFFER_BINDING, &saved_buffer);
+    s->GetIntegerv(GL_VIEWPORT, saved_viewport);
+    for (GLuint i = 0; i < 3; i++) {
+        s->GetVertexAttribiv(i, GL_VERTEX_ATTRIB_ARRAY_ENABLED, &saved_attrib[i]);
+    }
+    GLboolean saved_blend = s->IsEnabled(GL_BLEND);
+    GLboolean saved_scissor = s->IsEnabled(GL_SCISSOR_TEST);
+
+    float texw = 1.0f, texh = 1.0f;
+    s->ActiveTexture(GL_TEXTURE0);
+    if (SDL_GL_BindTexture(tex, &texw, &texh) != 0) {
+        return 0;
+    }
+
+    // Quad covering dst in NDC. GL's window origin is bottom-left, SDL's is
+    // top-left; SDL stores its textures top row first (t = 0 at the top).
+    float t0 = vpi_config.sharpen_flip ? texh : 0.0f;
+    float t1 = vpi_config.sharpen_flip ? 0.0f : texh;
+    const float pos[8] = { -1.0f, -1.0f,   1.0f, -1.0f,   -1.0f, 1.0f,   1.0f, 1.0f };
+    const float uv[8]  = {  0.0f, t1,      texw, t1,       0.0f, t0,     texw, t0 };
+
+    s->UseProgram(s->program);
+    s->BindBuffer(GL_ARRAY_BUFFER, 0);
+    s->Disable(GL_BLEND);
+    s->Disable(GL_SCISSOR_TEST);
+    s->Viewport(dst->x, out_h - dst->y - dst->h, dst->w, dst->h);
+    s->Uniform1i(s->u_tex, 0);
+    // One output pixel expressed in texture coordinates: the kernel runs at
+    // output resolution over the bilinearly upscaled picture.
+    s->Uniform2f(s->u_texel, texw / (float) dst->w, texh / (float) dst->h);
+    s->Uniform1f(s->u_sharp, vpi_config.sharpen);
+    s->VertexAttribPointer(s->a_pos, 2, GL_FLOAT, GL_FALSE, 0, pos);
+    s->VertexAttribPointer(s->a_uv, 2, GL_FLOAT, GL_FALSE, 0, uv);
+    s->EnableVertexAttribArray(s->a_pos);
+    s->EnableVertexAttribArray(s->a_uv);
+    s->DrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+
+    // Restore SDL's state exactly
+    for (GLuint i = 0; i < 3; i++) {
+        if (saved_attrib[i]) s->EnableVertexAttribArray(i); else s->DisableVertexAttribArray(i);
+    }
+    if ((GLuint) s->a_pos > 2) s->DisableVertexAttribArray(s->a_pos);
+    if ((GLuint) s->a_uv > 2) s->DisableVertexAttribArray(s->a_uv);
+    s->Viewport(saved_viewport[0], saved_viewport[1], saved_viewport[2], saved_viewport[3]);
+    if (saved_blend) s->Enable(GL_BLEND); else s->Disable(GL_BLEND);
+    if (saved_scissor) s->Enable(GL_SCISSOR_TEST); else s->Disable(GL_SCISSOR_TEST);
+    s->BindBuffer(GL_ARRAY_BUFFER, saved_buffer);
+    s->UseProgram(saved_program);
+    SDL_GL_UnbindTexture(tex);
+    s->ActiveTexture(GL_TEXTURE0);
+
+    return 1;
+}
+#endif // VANILLA_HAS_EGL
+
 int vui_update_sdl(vui_context_t *vui)
 {
     vui_sdl_event_thread(vui);
@@ -2617,7 +2929,13 @@ int vui_update_sdl(vui_context_t *vui)
         // Copy texture to window
         SDL_SetRenderDrawColor(renderer, 0, 0, 0, 0);
         SDL_RenderClear(renderer);
-        SDL_RenderCopy(renderer, main_tex, NULL, dst_rect);
+        int drawn = 0;
+#ifdef VANILLA_HAS_EGL
+        drawn = vui_sdl_sharpen_blit(renderer, main_tex, dst_rect, out_h);
+#endif
+        if (!drawn) {
+            SDL_RenderCopy(renderer, main_tex, NULL, dst_rect);
+        }
 
         // Flip surfaces
         SDL_RenderPresent(renderer);

@@ -35,6 +35,8 @@ typedef struct {
     int autoconnect;
     float screen_brightness;
     int safe_area_pct;
+    float sharpen;      // 0 = off, up to 1.0 = strongest sharpening on the final blit
+    int sharpen_flip;   // debug: flip the sharpening pass vertically if the picture is upside down
 } vpi_config_t;
 
 extern vpi_config_t vpi_config;

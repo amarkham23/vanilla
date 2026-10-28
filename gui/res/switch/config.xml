@@ -16,5 +16,7 @@
 	<cursorinfullscreen>0</cursorinfullscreen>
 	<safearea>2</safearea>
 	<brightness>1.0</brightness>
+	<sharpen>0.6</sharpen>
+	<sharpenflip>0</sharpenflip>
 	<recordingdir></recordingdir>
 </vanilla>
